@@ -1,18 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/INFURA/go-ethlibs/node"
 	flags "github.com/jessevdk/go-flags"
-	"golang.org/x/time/rate"
 )
 
 // Version of the binary, assigned during build.
@@ -103,29 +106,73 @@ func main() {
 		}
 	}()
 
-	var rlimit *rate.Limiter
-	if options.RateLimit != 0 {
-		rlimit = rate.NewLimiter(rate.Limit(options.RateLimit), 10)
+	// var rlimit *rate.Limiter
+	// if options.RateLimit != 0 {
+	// 	rlimit = rate.NewLimiter(rate.Limit(options.RateLimit), 10)
+	// }
+
+	const numWorkers = 250
+
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			buf := &bytes.Buffer{}
+			state := <-stateChannel
+
+			for {
+				// Update state when a new one is emitted
+				select {
+				case state = <-stateChannel:
+				case <-ctx.Done():
+					return
+				default:
+				}
+				// if rlimit != nil {
+				// 	rlimit.Wait(context.Background())
+				// }
+
+				if err := gen.Query(buf, state); err == io.EOF {
+					// Done
+					fmt.Println("query gen EOF")
+					return
+				} else if err != nil {
+					exit(2, "failed to write generated query: %s", err)
+				} else {
+					query(options.Web3Endpoint, buf)
+				}
+
+				buf.Reset()
+			}
+		}()
 	}
-	state := <-stateChannel
+
+	var prevCounter int64
+
 	for {
-		// Update state when a new one is emitted
-		select {
-		case state = <-stateChannel:
-		case <-ctx.Done():
-			return
-		default:
+		currentCounter := atomic.LoadInt64(&counter)
+		reqsPerSecond := currentCounter - prevCounter
+		prevCounter = currentCounter
+
+		log.Printf("req/s :: %d\n", reqsPerSecond)
+
+		if counter%100 == 0 {
+			log.Printf("sent %d requests\n", counter)
 		}
-		if rlimit != nil {
-			rlimit.Wait(context.Background())
-		}
-		if err := gen.Query(os.Stdout, state); err == io.EOF {
-			// Done
-			return
-		} else if err != nil {
-			exit(2, "failed to write generated query: %s", err)
-		}
+
+		time.Sleep(time.Second)
 	}
+}
+
+var counter int64
+
+func query(endpoint string, queryBuf *bytes.Buffer) {
+	// log.Println(queryBuf.String())
+
+	resp, err := http.Post(endpoint, "application/json", queryBuf)
+	if err != nil {
+		log.Printf("error: %s, status code: %d\n", err.Error(), resp.StatusCode)
+	}
+
+	atomic.AddInt64(&counter, 1)
 }
 
 type Generator func(io.Writer, State) error
